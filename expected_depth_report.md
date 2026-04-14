@@ -27,6 +27,18 @@ flowchart TD
     subgraph render_forward["cuda_rasterizer/render_forward.cu"]
         D["renderCUDA kernel<br/>第413行"]
 
+        Dpre["preprocess kernel<br/>第298行"]
+        Dpre_a["computeCov2D(...)<br/>第344行"]
+        Dpre_0["uvh = {txtz, tytz, 1}<br/>第199行 - 归一化像素坐标"]
+        Dpre_1["uvh_m = cov_cam_inv * uvh<br/>第200行 - 协方差逆变换"]
+        Dpre_2["uvh_mn = normalize(uvh_m)<br/>第201行 - 归一化"]
+        Dpre_3["l = norm3df(t.x, t.y, t.z)<br/>第211行 - 相机空间深度"]
+        Dpre_4["factor_normal = l / (u2+v2+1)<br/>第220行 - 射线长度归一化"]
+        Dpre_5["nJ_inv = mat3(v2+1,-uv,0; -uv,u2+1,0; -txtz,-tytz,0)<br/>第213-216行 - 近Jacobi逆矩阵"]
+        Dpre_6["plane = nJ_inv * (uvh_mn / vbn)<br/>第221行 - 平面方程系数"]
+        Dpre_7["ray_plane = {plane[0]*factor_normal/focal_x,<br/>plane[1]*factor_normal/focal_y,<br/>tc, 0.f}<br/>第233行 - 最终射线平面"]
+        Dpre_c["ray_planes[idx] = ray_plane<br/>第345行 - 写入全局内存"]
+
         D0["con_o.w * expf(power)<br/>第496行 - alpha计算"]
         D0a["conic_opacity[j]<br/>第486行 - con_o变量"]
         D0b["power = -0.5f * (con_o.x*d.x*d.x + con_o.z*d.y*d.y) - con_o.y*d.x*d.y<br/>第487行 - 高斯衰减指数"]
@@ -37,7 +49,7 @@ flowchart TD
 
         D1["Depth += t * aT<br/>第514行 - 深度加权累计"]
         D1a["t = ray_plane.x*d.x + ray_plane.y*d.y + ray_plane.z<br/>第513行 - 射线深度"]
-        D1b["ray_plane = collected_ray_planes[j]<br/>第511行 - 从内存加载"]
+        D1b["ray_plane = collected_ray_planes[j]<br/>第469行加载/第511行使用"]
         D1c["d = {xy.x - pixf.x, xy.y - pixf.y}<br/>第485行 - 像素到高斯中心的偏移"]
         D1d["T = test_T<br/>第523行 - 更新透射率"]
 
@@ -60,6 +72,17 @@ flowchart TD
     B1 --> C
     C --> C1
     C1 --> D
+    Dpre --> Dpre_a
+    Dpre_a --> Dpre_0
+    Dpre_0 --> Dpre_1
+    Dpre_1 --> Dpre_2
+    Dpre_2 --> Dpre_3
+    Dpre_3 --> Dpre_4
+    Dpre_4 --> Dpre_5
+    Dpre_5 --> Dpre_6
+    Dpre_6 --> Dpre_7
+    Dpre_7 --> Dpre_c
+    Dpre_c --> D1b
 
     D --> D0
     D0 --> D0c
@@ -111,11 +134,72 @@ flowchart TD
 
 ### Level 3: CUDA/C++ 实现层
 
+#### preprocess 阶段 (预处理每个 Gaussian)
+
 | 文件 | 行号 | 说明 |
 |------|------|------|
+| `cuda_rasterizer/render_forward.cu` | 298 | `preprocess` kernel 入口 |
+| `cuda_rasterizer/render_forward.cu` | 344 | `computeCov2D<...>(..., &normals[idx], &ray_planes[idx], ...)` |
+| `cuda_rasterizer/render_forward.cu` | 199 | `uvh = {txtz, tytz, 1}` - 归一化像素坐标 |
+| `cuda_rasterizer/render_forward.cu` | 200 | `uvh_m = cov_cam_inv * uvh` - 协方差逆矩阵变换 |
+| `cuda_rasterizer/render_forward.cu` | 201 | `uvh_mn = normalize(uvh_m)` - 归一化 |
+| `cuda_rasterizer/render_forward.cu` | 211 | `l = norm3df(t.x, t.y, t.z)` - 相机空间深度 |
+| `cuda_rasterizer/render_forward.cu` | 220 | `factor_normal = l / (u2+v2+1)` - 射线长度归一化因子 |
+| `cuda_rasterizer/render_forward.cu` | 213-216 | `nJ_inv` 矩阵 - 近Jacobi矩阵的逆 |
+| `cuda_rasterizer/render_forward.cu` | 221 | `plane = nJ_inv * (uvh_mn / max(vbn, 1e-7f))` - 平面方程系数 |
+| `cuda_rasterizer/render_forward.cu` | 231/233 | `*ray_plane = {...}` - **最终射线平面输出** |
+| `cuda_rasterizer/render_forward.cu` | 345 | `ray_planes[idx] = ray_plane` - 写入全局内存 |
+
+**ray_plane 完整计算流程 (computeCov2D 函数内):**
+```cpp
+// render_forward.cu 第199-233行
+// Step 1: 构建归一化像素射线方向
+glm::vec3 uvh    = {txtz, tytz, 1};           // 第199行
+glm::vec3 uvh_m  = cov_cam_inv * uvh;         // 第200行 - 协方差逆变换
+glm::vec3 uvh_mn = glm::normalize(uvh_m);    // 第201行 - 归一化
+
+// Step 2: 计算归一化因子
+const float l = norm3df(t.x, t.y, t.z);      // 第211行 - 相机空间深度
+float u2 = txtz * txtz;                       // 第207行
+float v2 = tytz * tytz;                       // 第208行
+float ray_len2 = u2 + v2 + 1;                 // 第219行
+float factor_normal = l / ray_len2;           // 第220行 - 归一化因子
+
+// Step 3: 构建近Jacobi矩阵的逆
+glm::mat3 nJ_inv = glm::mat3(                 // 第213-216行
+    v2 + 1, -uv, 0,
+    -uv, u2 + 1, 0,
+    -txtz, -tytz, 0);
+
+// Step 4: 计算平面方程
+float vbn = glm::dot(uvh_mn, uvh);           // 第218行
+glm::vec3 plane = nJ_inv * (uvh_mn / max(vbn, 1e-7f));  // 第221行
+
+// Step 5: 输出 ray_plane
+*ray_plane = {
+    plane[0] * factor_normal / focal_x,       // x: 2D切线方向X
+    plane[1] * factor_normal / focal_y,       // y: 2D切线方向Y
+    tc,                                        // z: 相机空间深度
+    0.f                                        // w: 0
+};  // 第233行
+```
+
+**ray_plane 物理含义:**
+- `(x, y)`: 射线在 2D 屏幕空间的切线方向向量
+- `z = tc`: 该 Gaussian 中心在相机坐标系下的深度
+- `w = 0`: 占位符
+- `t = ray_plane.x*d.x + ray_plane.y*d.y + ray_plane.z`: 用于计算当前像素沿射线到 Gaussian 的深度
+
+#### renderCUDA 阶段 (渲染循环)
+
+| 文件 | 行号 | 说明 |
+|------|------|------|
+| `cuda_rasterizer/render_forward.cu` | 413 | `renderCUDA` kernel 入口 |
 | `cuda_rasterizer/render_forward.cu` | 447 | `float Depth = 0` - 期望深度累计变量 |
 | `cuda_rasterizer/render_forward.cu` | 448 | `float mDepth = 0` - 中值深度变量 |
 | `cuda_rasterizer/render_forward.cu` | 422 | `rln = rnorm3df(pixnf.x, pixnf.y, 1.f)` - 射线归一化因子 |
+| `cuda_rasterizer/render_forward.cu` | 438 | `__shared__ float3 collected_ray_planes[BLOCK_SIZE]` - 共享内存缓存 |
+| `cuda_rasterizer/render_forward.cu` | 469-471 | 从 `ray_planes[coll_id]` 加载到共享内存 |
 | `cuda_rasterizer/render_forward.cu` | 442-451 | 辅助变量初始化 (T, contributor, last_contributor等) |
 | `cuda_rasterizer/render_forward.cu` | 485 | `d = {xy.x - pixf.x, xy.y - pixf.y}` - 像素到高斯中心偏移 |
 | `cuda_rasterizer/render_forward.cu` | 486 | `con_o = collected_conic_opacity[j]` - 从共享内存加载 |
